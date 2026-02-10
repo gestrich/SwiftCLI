@@ -689,6 +689,133 @@ public actor CLIClient {
         )
     }
 
+    // MARK: - Line-Buffered Streaming
+
+    /// Stream stdout line-by-line as raw strings.
+    /// Returns an `AsyncThrowingStream` that throws `CLIClientError.executionFailed` on non-zero exit.
+    public func streamLines(
+        command: String,
+        arguments: [String] = [],
+        workingDirectory: String? = nil,
+        environment: [String: String]? = nil,
+        printCommand: Bool = true,
+        stdin: Data? = nil,
+        output: CLIOutputStream? = nil
+    ) -> AsyncThrowingStream<String, Error> {
+        streamLines(
+            command: command,
+            arguments: arguments,
+            workingDirectory: workingDirectory,
+            environment: environment,
+            printCommand: printCommand,
+            stdin: stdin,
+            parser: PassthroughLineParser(),
+            output: output
+        )
+    }
+
+    /// Stream stdout line-by-line, transforming each line with a parser.
+    /// Returns an `AsyncThrowingStream` that throws `CLIClientError.executionFailed` on non-zero exit.
+    public func streamLines<P: CLILineParser>(
+        command: String,
+        arguments: [String] = [],
+        workingDirectory: String? = nil,
+        environment: [String: String]? = nil,
+        printCommand: Bool = true,
+        stdin: Data? = nil,
+        parser: P,
+        output: CLIOutputStream? = nil
+    ) -> AsyncThrowingStream<P.Output, Error> {
+        AsyncThrowingStream { continuation in
+            Task {
+                let prepared = await self.prepareCommand(
+                    command: command,
+                    arguments: arguments,
+                    workingDirectory: workingDirectory,
+                    environment: environment,
+                    printCommand: printCommand,
+                    output: output
+                )
+
+                switch prepared {
+                case .success(let info):
+                    do {
+                        try await self.runLineBufferedProcess(
+                            command: info.resolvedCommand,
+                            arguments: arguments,
+                            workingDirectory: info.effectiveWorkingDirectory,
+                            environment: info.processEnvironment,
+                            stdin: stdin,
+                            commandID: info.commandID,
+                            parser: parser,
+                            continuation: continuation,
+                            output: output
+                        )
+                    } catch {
+                        continuation.finish(throwing: error)
+                        let errorOutput = StreamOutput.error(commandID: info.commandID, error: error)
+                        await self.globalOutput.send(errorOutput)
+                        await output?.send(errorOutput)
+                    }
+                case .failure(let error):
+                    continuation.finish(throwing: error)
+                }
+            }
+        }
+    }
+
+    /// Stream a typed CLI command's stdout line-by-line as raw strings.
+    public func streamLines<C: CLICommand>(
+        _ command: C,
+        workingDirectory: String? = nil,
+        environment: [String: String]? = nil,
+        printCommand: Bool = true,
+        stdin: Data? = nil,
+        output: CLIOutputStream? = nil
+    ) -> AsyncThrowingStream<String, Error> {
+        let commandLine = command.commandLine
+        guard let programName = commandLine.first else {
+            return AsyncThrowingStream { $0.finish(throwing: CLIClientError.invalidCommand("Empty command line")) }
+        }
+        let arguments = Array(commandLine.dropFirst())
+        return streamLines(
+            command: programName,
+            arguments: arguments,
+            workingDirectory: workingDirectory,
+            environment: environment,
+            printCommand: printCommand,
+            stdin: stdin,
+            output: output
+        )
+    }
+
+    /// Stream a typed CLI command's stdout line-by-line, transforming each line with a parser.
+    public func streamLines<C: CLICommand, P: CLILineParser>(
+        _ command: C,
+        parser: P,
+        workingDirectory: String? = nil,
+        environment: [String: String]? = nil,
+        printCommand: Bool = true,
+        stdin: Data? = nil,
+        output: CLIOutputStream? = nil
+    ) -> AsyncThrowingStream<P.Output, Error> {
+        let commandLine = command.commandLine
+        guard let programName = commandLine.first else {
+            return AsyncThrowingStream { $0.finish(throwing: CLIClientError.invalidCommand("Empty command line")) }
+        }
+        let arguments = Array(commandLine.dropFirst())
+        return streamLines(
+            command: programName,
+            arguments: arguments,
+            workingDirectory: workingDirectory,
+            environment: environment,
+            printCommand: printCommand,
+            stdin: stdin,
+            parser: parser,
+            output: output
+        )
+    }
+
     // MARK: - Typed Command Execution
 
     /// Execute a typed command and return both the parsed output and execution result.
@@ -847,6 +974,111 @@ public actor CLIClient {
             commandContinuation: continuation,
             output: output
         )
+    }
+
+    /// Line-buffered process execution using `bytes.lines` for stdout.
+    /// Unlike `runProcess()` which uses `readabilityHandler` for raw data chunks,
+    /// this reads stdout one line at a time and yields parsed values to the continuation.
+    /// Stderr is still captured via `readabilityHandler`.
+    private func runLineBufferedProcess<P: CLILineParser>(
+        command: String,
+        arguments: [String],
+        workingDirectory: String?,
+        environment: [String: String],
+        stdin: Data? = nil,
+        commandID: CommandID,
+        parser: P,
+        continuation: AsyncThrowingStream<P.Output, Error>.Continuation,
+        output: CLIOutputStream? = nil
+    ) async throws {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: command)
+        process.arguments = arguments
+        process.environment = environment
+
+        if let workingDirectory {
+            process.currentDirectoryURL = URL(fileURLWithPath: workingDirectory)
+        }
+
+        let stderrAccumulator = OutputAccumulator()
+        let globalOutputStream = self.globalOutput
+        let clientOutputStream = output
+
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
+
+        var stdinPipe: Pipe?
+        if stdin != nil {
+            let inputPipe = Pipe()
+            process.standardInput = inputPipe
+            stdinPipe = inputPipe
+        }
+
+        // Stderr via readabilityHandler (same as runProcess)
+        stderrPipe.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            if !data.isEmpty, let text = String(data: data, encoding: .utf8) {
+                stderrAccumulator.append(text)
+                print(text, terminator: "")
+
+                let streamOutput = StreamOutput.stderr(commandID: commandID, text: text)
+                Task {
+                    await globalOutputStream.send(streamOutput)
+                }
+                if let clientOutput = clientOutputStream {
+                    Task {
+                        await clientOutput.send(streamOutput)
+                    }
+                }
+            }
+        }
+
+        try process.run()
+
+        // Write stdin data and close
+        if let stdinData = stdin, let inputPipe = stdinPipe {
+            inputPipe.fileHandleForWriting.write(stdinData)
+            inputPipe.fileHandleForWriting.closeFile()
+        }
+
+        // Read stdout line-by-line using bytes.lines
+        for try await line in stdoutPipe.fileHandleForReading.bytes.lines {
+            let lineWithNewline = line + "\n"
+            print(lineWithNewline, terminator: "")
+
+            let streamOutput = StreamOutput.stdout(commandID: commandID, text: lineWithNewline)
+            await globalOutputStream.send(streamOutput)
+            await clientOutputStream?.send(streamOutput)
+
+            if let parsed = try parser.parse(line: line) {
+                continuation.yield(parsed)
+            }
+        }
+
+        process.waitUntilExit()
+
+        // Clean up stderr handler
+        stderrPipe.fileHandleForReading.readabilityHandler = nil
+
+        let exitCode = process.terminationStatus
+
+        // Send exit to output streams
+        let exitOutput = StreamOutput.exit(commandID: commandID, code: exitCode)
+        await globalOutput.send(exitOutput)
+        await clientOutputStream?.send(exitOutput)
+
+        if exitCode != 0 {
+            let stderr = stderrAccumulator.value
+            continuation.finish(throwing: CLIClientError.executionFailed(
+                command: "\(command) \(arguments.joined(separator: " "))",
+                exitCode: exitCode,
+                output: stderr
+            ))
+        } else {
+            continuation.finish()
+        }
     }
 }
 
