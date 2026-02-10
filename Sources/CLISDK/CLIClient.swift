@@ -130,6 +130,7 @@ public actor CLIClient {
         timeout: TimeInterval? = nil,
         printCommand: Bool = true,
         inheritIO: Bool = false,
+        stdin: Data? = nil,
         output: CLIOutputStream? = nil
     ) async throws -> ExecutionResult {
         // Resolve and prepare command - this handles errors and sends to global stream
@@ -152,6 +153,7 @@ public actor CLIClient {
                 timeout: timeout,
                 startTime: Date(),
                 inheritIO: inheritIO,
+                stdin: stdin,
                 commandID: info.commandID,
                 output: output
             )
@@ -209,6 +211,7 @@ public actor CLIClient {
         workingDirectory: String? = nil,
         environment: [String: String]? = nil,
         printCommand: Bool = true,
+        stdin: Data? = nil,
         output: CLIOutputStream? = nil
     ) -> AsyncStream<StreamOutput> {
         AsyncStream { continuation in
@@ -235,6 +238,7 @@ public actor CLIClient {
                         arguments: arguments,
                         workingDirectory: info.effectiveWorkingDirectory,
                         environment: info.processEnvironment,
+                        stdin: stdin,
                         commandID: info.commandID,
                         continuation: continuation,
                         output: output
@@ -473,6 +477,7 @@ public actor CLIClient {
         timeout: TimeInterval?,
         startTime: Date,
         inheritIO: Bool,
+        stdin: Data? = nil,
         commandID: CommandID,
         output: CLIOutputStream? = nil
     ) async throws -> ExecutionResult {
@@ -483,6 +488,7 @@ public actor CLIClient {
             environment: environment,
             timeout: timeout,
             inheritIO: inheritIO,
+            stdin: stdin,
             commandID: commandID,
             commandContinuation: nil,
             output: output
@@ -508,6 +514,7 @@ public actor CLIClient {
         environment: [String: String],
         timeout: TimeInterval?,
         inheritIO: Bool,
+        stdin: Data? = nil,
         commandID: CommandID,
         commandContinuation: AsyncStream<StreamOutput>.Continuation?,
         output: CLIOutputStream? = nil
@@ -532,6 +539,7 @@ public actor CLIClient {
 
         let outputPipe: Pipe?
         let errorPipe: Pipe?
+        var stdinPipe: Pipe?
 
         if inheritIO {
             process.standardInput = FileHandle.standardInput
@@ -540,6 +548,12 @@ public actor CLIClient {
             outputPipe = nil
             errorPipe = nil
         } else {
+            // Set up stdin pipe if data was provided
+            if stdin != nil {
+                let inputPipe = Pipe()
+                process.standardInput = inputPipe
+                stdinPipe = inputPipe
+            }
             let outPipe = Pipe()
             let errPipe = Pipe()
             process.standardOutput = outPipe
@@ -610,6 +624,13 @@ public actor CLIClient {
         }
 
         try process.run()
+
+        // Write stdin data and close the pipe after the process starts
+        if let stdinData = stdin, let inputPipe = stdinPipe {
+            inputPipe.fileHandleForWriting.write(stdinData)
+            inputPipe.fileHandleForWriting.closeFile()
+        }
+
         process.waitUntilExit()
 
         timeoutTask?.cancel()
@@ -808,6 +829,7 @@ public actor CLIClient {
         arguments: [String],
         workingDirectory: String?,
         environment: [String: String],
+        stdin: Data? = nil,
         commandID: CommandID,
         continuation: AsyncStream<StreamOutput>.Continuation,
         output: CLIOutputStream? = nil
@@ -820,6 +842,7 @@ public actor CLIClient {
             environment: environment,
             timeout: nil,
             inheritIO: false,
+            stdin: stdin,
             commandID: commandID,
             commandContinuation: continuation,
             output: output
