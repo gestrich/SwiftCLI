@@ -192,6 +192,65 @@ struct CLIOutputStreamTests {
         #expect(hasOpTwo, "Client stream should receive operation-two output")
     }
 
+    // MARK: - printOutput Tests
+
+    @Test("execute captures stdout when printOutput is false")
+    func testExecuteCapturesOutputWhenQuiet() async throws {
+        let client = CLIClient(printOutput: false)
+
+        let result = try await client.execute(
+            command: "echo",
+            arguments: ["quiet-test"],
+            printCommand: false
+        )
+
+        #expect(result.isSuccess)
+        #expect(result.stdout.contains("quiet-test"))
+    }
+
+    @Test("execute captures stderr when printOutput is false")
+    func testExecuteCapturesStderrWhenQuiet() async throws {
+        let client = CLIClient(printOutput: false)
+
+        let result = try await client.execute(
+            command: "/bin/bash",
+            arguments: ["-c", "echo error-output >&2"],
+            printCommand: false
+        )
+
+        #expect(result.stderr.contains("error-output"))
+    }
+
+    @Test("execute still streams to global output when printOutput is false")
+    func testQuietModeStillStreamsToGlobalOutput() async throws {
+        let client = CLIClient(printOutput: false)
+
+        let globalTask = Task { () -> [StreamOutput] in
+            var received: [StreamOutput] = []
+            for await item in await client.outputStream() {
+                received.append(item)
+                if case .exit = item { break }
+            }
+            return received
+        }
+
+        // Give subscriber time to register
+        try await Task.sleep(nanoseconds: 20_000_000)
+
+        _ = try await client.execute(
+            command: "echo",
+            arguments: ["stream-test"],
+            printCommand: false
+        )
+
+        // Give streams time to receive all output
+        try await Task.sleep(nanoseconds: 50_000_000)
+
+        let globalOutput = await globalTask.value
+        let hasOutput = globalOutput.contains { isStdout($0, "stream-test\n") }
+        #expect(hasOutput, "Global stream should still receive output when printOutput is false")
+    }
+
     // MARK: - Original CLIOutputStream Tests
 
     @Test("Single subscriber receives output")

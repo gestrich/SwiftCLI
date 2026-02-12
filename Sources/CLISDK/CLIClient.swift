@@ -18,11 +18,15 @@ public actor CLIClient {
     /// Default working directory for commands (nil uses current directory)
     private var defaultWorkingDirectory: String?
 
+    /// Whether to print stdout/stderr to the console in real-time
+    private let printOutput: Bool
+
     /// Cache for executable paths
     private var executableCache: [String: String] = [:]
 
-    public init(defaultWorkingDirectory: String? = nil) {
+    public init(defaultWorkingDirectory: String? = nil, printOutput: Bool = true) {
         self.defaultWorkingDirectory = defaultWorkingDirectory
+        self.printOutput = printOutput
 
         // Pre-compute environment with common tool paths
         var environment = ProcessInfo.processInfo.environment
@@ -364,7 +368,7 @@ public actor CLIClient {
             continuation?.yield(errorOutput)
             continuation?.finish()
 
-            if printCommand {
+            if printCommand && printOutput {
                 print(commandLine, terminator: "")
                 print("❌ Error: \(error.localizedDescription)")
             }
@@ -392,7 +396,7 @@ public actor CLIClient {
         await output?.send(commandOutput)
         continuation?.yield(commandOutput)
 
-        if printCommand {
+        if printCommand && printOutput {
             print(commandLine, terminator: "")
         }
 
@@ -533,7 +537,8 @@ public actor CLIClient {
         let stdoutAccumulator = OutputAccumulator()
         let stderrAccumulator = OutputAccumulator()
 
-        // Capture streams for use in closures
+        // Capture values for use in non-isolated closures
+        let shouldPrint = self.printOutput
         let globalOutputStream = self.globalOutput
         let clientOutputStream = output
 
@@ -566,7 +571,9 @@ public actor CLIClient {
                 let data = handle.availableData
                 if !data.isEmpty, let text = String(data: data, encoding: .utf8) {
                     stdoutAccumulator.append(text)
-                    print(text, terminator: "")
+                    if shouldPrint {
+                        print(text, terminator: "")
+                    }
 
                     let streamOutput = StreamOutput.stdout(commandID: commandID, text: text)
 
@@ -591,7 +598,9 @@ public actor CLIClient {
                 let data = handle.availableData
                 if !data.isEmpty, let text = String(data: data, encoding: .utf8) {
                     stderrAccumulator.append(text)
-                    print(text, terminator: "")
+                    if shouldPrint {
+                        print(text, terminator: "")
+                    }
 
                     let streamOutput = StreamOutput.stderr(commandID: commandID, text: text)
 
@@ -646,7 +655,9 @@ public actor CLIClient {
         let stdout = stdoutAccumulator.value
         if !stdout.isEmpty && !stdout.hasSuffix("\n") {
             let newline = "\n"
-            print(newline, terminator: "")
+            if shouldPrint {
+                print(newline, terminator: "")
+            }
             let newlineOutput = StreamOutput.stdout(commandID: commandID, text: newline)
             commandContinuation?.yield(newlineOutput)
             Task {
@@ -1001,6 +1012,7 @@ public actor CLIClient {
         }
 
         let stderrAccumulator = OutputAccumulator()
+        let shouldPrint = self.printOutput
         let globalOutputStream = self.globalOutput
         let clientOutputStream = output
 
@@ -1021,7 +1033,9 @@ public actor CLIClient {
             let data = handle.availableData
             if !data.isEmpty, let text = String(data: data, encoding: .utf8) {
                 stderrAccumulator.append(text)
-                print(text, terminator: "")
+                if shouldPrint {
+                    print(text, terminator: "")
+                }
 
                 let streamOutput = StreamOutput.stderr(commandID: commandID, text: text)
                 Task {
@@ -1046,7 +1060,9 @@ public actor CLIClient {
         // Read stdout line-by-line using bytes.lines
         for try await line in stdoutPipe.fileHandleForReading.bytes.lines {
             let lineWithNewline = line + "\n"
-            print(lineWithNewline, terminator: "")
+            if shouldPrint {
+                print(lineWithNewline, terminator: "")
+            }
 
             let streamOutput = StreamOutput.stdout(commandID: commandID, text: lineWithNewline)
             await globalOutputStream.send(streamOutput)
