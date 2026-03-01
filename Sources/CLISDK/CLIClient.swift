@@ -1057,8 +1057,8 @@ public actor CLIClient {
             inputPipe.fileHandleForWriting.closeFile()
         }
 
-        // Read stdout line-by-line using bytes.lines
-        for try await line in stdoutPipe.fileHandleForReading.bytes.lines {
+        // Read stdout line-by-line
+        for try await line in asyncLines(from: stdoutPipe.fileHandleForReading) {
             let lineWithNewline = line + "\n"
             if shouldPrint {
                 print(lineWithNewline, terminator: "")
@@ -1094,6 +1094,23 @@ public actor CLIClient {
             ))
         } else {
             continuation.finish()
+        }
+    }
+}
+
+/// Cross-platform async line reader for FileHandle (FileHandle.bytes.lines is not available on Linux)
+private func asyncLines(from fileHandle: FileHandle) -> AsyncStream<String> {
+    AsyncStream { continuation in
+        fileHandle.readabilityHandler = { handle in
+            let data = handle.availableData
+            if data.isEmpty {
+                fileHandle.readabilityHandler = nil
+                continuation.finish()
+            } else if let chunk = String(data: data, encoding: .utf8) {
+                for line in chunk.components(separatedBy: "\n") where !line.isEmpty {
+                    continuation.yield(line)
+                }
+            }
         }
     }
 }
