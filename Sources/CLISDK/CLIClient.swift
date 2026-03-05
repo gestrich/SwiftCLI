@@ -644,9 +644,24 @@ public actor CLIClient {
 
         timeoutTask?.cancel()
 
-        // Clean up handlers
+        // Nil the handlers first so they don't race with the drain reads below.
         outputPipe?.fileHandleForReading.readabilityHandler = nil
         errorPipe?.fileHandleForReading.readabilityHandler = nil
+
+        // Drain any bytes that arrived after the last readabilityHandler invocation.
+        // readabilityHandler is GCD-dispatched and may not have consumed all buffered
+        // data by the time waitUntilExit() returns.
+        if let outPipe = outputPipe,
+           let text = String(data: outPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8),
+           !text.isEmpty {
+            stdoutAccumulator.append(text)
+            if shouldPrint { print(text, terminator: "") }
+        }
+        if let errPipe = errorPipe,
+           let text = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8),
+           !text.isEmpty {
+            stderrAccumulator.append(text)
+        }
 
         let exitCode = process.terminationStatus
         let duration = Date().timeIntervalSince(startTime)
