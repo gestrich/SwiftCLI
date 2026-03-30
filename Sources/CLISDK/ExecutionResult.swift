@@ -14,9 +14,14 @@ public struct ExecutionResult: Sendable {
     /// Time taken to execute the command
     public let duration: TimeInterval
 
-    /// Number of bytes recovered by the post-exit pipe drain (after readabilityHandler was niled).
-    /// Zero means readDataToEndOfFile() returned empty — the kernel pipe buffer was already drained
-    /// by a concurrent readabilityHandler callback, which is the expected symptom of the GCD race.
+    /// DIAGNOSTIC FIELD — retained to investigate a suspected GCD race in the pipe drain.
+    /// See: AIDevTools/docs/proposed/2026-03-29-f-cli-pipe-drain-and-diagnostics.md
+    ///
+    /// How many bytes readDataToEndOfFile() recovered after readabilityHandler was set to nil.
+    /// A value of 0 when the caller reports truncated output means the kernel pipe buffer was
+    /// already empty by the time the drain ran — consistent with a concurrent readabilityHandler
+    /// callback having consumed the bytes first. Once the race is confirmed (or ruled out) and
+    /// a proper fix is in place, this field can be removed.
     public let drainByteCount: Int
 
     /// Whether the command succeeded (exit code 0)
