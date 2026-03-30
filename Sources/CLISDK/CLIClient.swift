@@ -651,9 +651,11 @@ public actor CLIClient {
         // Drain any bytes that arrived after the last readabilityHandler invocation.
         // readabilityHandler is GCD-dispatched and may not have consumed all buffered
         // data by the time waitUntilExit() returns.
+        var drainByteCount = 0
         if let outPipe = outputPipe,
            let text = String(data: outPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8),
            !text.isEmpty {
+            drainByteCount = text.utf8.count
             stdoutAccumulator.append(text)
             if shouldPrint { print(text, terminator: "") }
         }
@@ -711,7 +713,8 @@ public actor CLIClient {
             exitCode: exitCode,
             stdout: stdoutAccumulator.value,
             stderr: stderrAccumulator.value,
-            duration: duration
+            duration: duration,
+            drainByteCount: drainByteCount
         )
     }
 

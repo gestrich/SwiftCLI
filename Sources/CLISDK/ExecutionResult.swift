@@ -14,6 +14,11 @@ public struct ExecutionResult: Sendable {
     /// Time taken to execute the command
     public let duration: TimeInterval
 
+    /// Number of bytes recovered by the post-exit pipe drain (after readabilityHandler was niled).
+    /// Zero means readDataToEndOfFile() returned empty — the kernel pipe buffer was already drained
+    /// by a concurrent readabilityHandler callback, which is the expected symptom of the GCD race.
+    public let drainByteCount: Int
+
     /// Whether the command succeeded (exit code 0)
     public var isSuccess: Bool {
         exitCode == 0
@@ -35,11 +40,12 @@ public struct ExecutionResult: Sendable {
         return stdout.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    public init(exitCode: Int32, stdout: String, stderr: String, duration: TimeInterval) {
+    public init(exitCode: Int32, stdout: String, stderr: String, duration: TimeInterval, drainByteCount: Int = 0) {
         self.exitCode = exitCode
         self.stdout = stdout
         self.stderr = stderr
         self.duration = duration
+        self.drainByteCount = drainByteCount
     }
 }
 
