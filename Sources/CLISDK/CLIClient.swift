@@ -485,18 +485,24 @@ public actor CLIClient {
         commandID: CommandID,
         output: CLIOutputStream? = nil
     ) async throws -> ExecutionResult {
-        return try self.runProcess(
-            command: command,
-            arguments: arguments,
-            workingDirectory: workingDirectory,
-            environment: environment,
-            timeout: timeout,
-            inheritIO: inheritIO,
-            stdin: stdin,
-            commandID: commandID,
-            commandContinuation: nil,
-            output: output
-        )
+        let holder = ProcessHolder()
+        return try await withTaskCancellationHandler {
+            try self.runProcess(
+                command: command,
+                arguments: arguments,
+                workingDirectory: workingDirectory,
+                environment: environment,
+                timeout: timeout,
+                inheritIO: inheritIO,
+                stdin: stdin,
+                commandID: commandID,
+                commandContinuation: nil,
+                processHolder: holder,
+                output: output
+            )
+        } onCancel: {
+            holder.process?.terminate()
+        }
     }
 
     /// Unified process execution - always streams output in real-time and broadcasts to global stream
@@ -521,10 +527,12 @@ public actor CLIClient {
         stdin: Data? = nil,
         commandID: CommandID,
         commandContinuation: AsyncStream<StreamOutput>.Continuation?,
+        processHolder: ProcessHolder? = nil,
         output: CLIOutputStream? = nil
     ) throws -> ExecutionResult {
         let startTime = Date()
         let process = Process()
+        processHolder?.process = process
         process.executableURL = URL(fileURLWithPath: command)
         process.arguments = arguments
         process.environment = environment
@@ -1131,6 +1139,10 @@ private func asyncLines(from fileHandle: FileHandle) -> AsyncStream<String> {
             }
         }
     }
+}
+
+private final class ProcessHolder: @unchecked Sendable {
+    var process: Process?
 }
 
 /// Thread-safe string accumulator for capturing output in concurrent contexts
