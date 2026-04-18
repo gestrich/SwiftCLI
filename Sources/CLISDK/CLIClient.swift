@@ -485,7 +485,7 @@ public actor CLIClient {
         commandID: CommandID,
         output: CLIOutputStream? = nil
     ) async throws -> ExecutionResult {
-        let holder = ProcessHolder()
+        let cancellationHandle = CancellationHandle()
         return try await withTaskCancellationHandler {
             try self.runProcess(
                 command: command,
@@ -497,11 +497,11 @@ public actor CLIClient {
                 stdin: stdin,
                 commandID: commandID,
                 commandContinuation: nil,
-                processHolder: holder,
+                cancellationHandle: cancellationHandle,
                 output: output
             )
         } onCancel: {
-            holder.process?.terminate()
+            cancellationHandle.cancel()
         }
     }
 
@@ -527,12 +527,12 @@ public actor CLIClient {
         stdin: Data? = nil,
         commandID: CommandID,
         commandContinuation: AsyncStream<StreamOutput>.Continuation?,
-        processHolder: ProcessHolder? = nil,
+        cancellationHandle: CancellationHandle? = nil,
         output: CLIOutputStream? = nil
     ) throws -> ExecutionResult {
         let startTime = Date()
         let process = Process()
-        processHolder?.process = process
+        cancellationHandle?.register(process)
         process.executableURL = URL(fileURLWithPath: command)
         process.arguments = arguments
         process.environment = environment
@@ -1141,8 +1141,17 @@ private func asyncLines(from fileHandle: FileHandle) -> AsyncStream<String> {
     }
 }
 
-private final class ProcessHolder: @unchecked Sendable {
-    var process: Process?
+
+private final class CancellationHandle: Sendable {
+    private let mutex = Mutex<Process?>(nil)
+
+    func register(_ process: Process) {
+        mutex.withLock { $0 = process }
+    }
+
+    func cancel() {
+        mutex.withLock { $0 }?.terminate()
+    }
 }
 
 /// Thread-safe string accumulator for capturing output in concurrent contexts
