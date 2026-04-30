@@ -237,7 +237,7 @@ public actor CLIClient {
                 }
 
                 do {
-                    try self.streamProcess(
+                    try await self.streamProcess(
                         command: info.resolvedCommand,
                         arguments: arguments,
                         workingDirectory: info.effectiveWorkingDirectory,
@@ -487,7 +487,7 @@ public actor CLIClient {
     ) async throws -> ExecutionResult {
         let cancellationHandle = CancellationHandle()
         return try await withTaskCancellationHandler {
-            try self.runProcess(
+            try await self.runProcess(
                 command: command,
                 arguments: arguments,
                 workingDirectory: workingDirectory,
@@ -529,7 +529,7 @@ public actor CLIClient {
         commandContinuation: AsyncStream<StreamOutput>.Continuation?,
         cancellationHandle: CancellationHandle? = nil,
         output: CLIOutputStream? = nil
-    ) throws -> ExecutionResult {
+    ) async throws -> ExecutionResult {
         let startTime = Date()
         let process = Process()
         cancellationHandle?.register(process)
@@ -640,6 +640,15 @@ public actor CLIClient {
             }
         }
 
+        // Set up termination handler BEFORE run() to avoid a race where the
+        // process exits before the handler is installed.
+        let terminationSignal = AsyncStream<Void> { continuation in
+            process.terminationHandler = { _ in
+                continuation.yield()
+                continuation.finish()
+            }
+        }
+
         try process.run()
 
         // Write stdin data and close the pipe after the process starts
@@ -648,7 +657,8 @@ public actor CLIClient {
             inputPipe.fileHandleForWriting.closeFile()
         }
 
-        process.waitUntilExit()
+        // Wait for process to exit without blocking a cooperative thread.
+        for await _ in terminationSignal { break }
 
         timeoutTask?.cancel()
 
@@ -658,7 +668,7 @@ public actor CLIClient {
 
         // Drain any bytes that arrived after the last readabilityHandler invocation.
         // readabilityHandler is GCD-dispatched and may not have consumed all buffered
-        // data by the time waitUntilExit() returns.
+        // data by the time the process exits.
         var drainByteCount = 0
         if let outPipe = outputPipe,
            let text = String(data: outPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8),
@@ -997,9 +1007,9 @@ public actor CLIClient {
         commandID: CommandID,
         continuation: AsyncStream<StreamOutput>.Continuation,
         output: CLIOutputStream? = nil
-    ) throws {
+    ) async throws {
         // Use unified runProcess - it handles continuation and global broadcast
-        _ = try runProcess(
+        _ = try await runProcess(
             command: command,
             arguments: arguments,
             workingDirectory: workingDirectory,
@@ -1075,6 +1085,15 @@ public actor CLIClient {
             }
         }
 
+        // Set up termination handler BEFORE run() to avoid a race where the
+        // process exits before the handler is installed.
+        let terminationSignal = AsyncStream<Void> { continuation in
+            process.terminationHandler = { _ in
+                continuation.yield()
+                continuation.finish()
+            }
+        }
+
         try process.run()
 
         // Write stdin data and close
@@ -1099,7 +1118,8 @@ public actor CLIClient {
             }
         }
 
-        process.waitUntilExit()
+        // Wait for process to exit without blocking a cooperative thread.
+        for await _ in terminationSignal { break }
 
         // Clean up stderr handler
         stderrPipe.fileHandleForReading.readabilityHandler = nil
