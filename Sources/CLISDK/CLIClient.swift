@@ -585,10 +585,12 @@ public actor CLIClient {
             outPipe.fileHandleForReading.readabilityHandler = { handle in
                 let data = handle.availableData
                 if data.isEmpty {
-                    // EOF — signal without self-canceling; handler is cancelled from
-                    // outside after the EOF await, which is safe on both macOS and Linux.
-                    stdoutEOFCont.yield()
-                    stdoutEOFCont.finish()
+                    // EOF — enqueue via Task so we never call into the Swift concurrency
+                    // runtime directly from a GCD callback (crashes libdispatch on Linux).
+                    Task {
+                        stdoutEOFCont.yield()
+                        stdoutEOFCont.finish()
+                    }
                 } else if let text = String(data: data, encoding: .utf8) {
                     stdoutAccumulator.append(text)
                     if shouldPrint {
@@ -617,8 +619,10 @@ public actor CLIClient {
             errPipe.fileHandleForReading.readabilityHandler = { handle in
                 let data = handle.availableData
                 if data.isEmpty {
-                    stderrEOFCont.yield()
-                    stderrEOFCont.finish()
+                    Task {
+                        stderrEOFCont.yield()
+                        stderrEOFCont.finish()
+                    }
                 } else if let text = String(data: data, encoding: .utf8) {
                     stderrAccumulator.append(text)
                     if shouldPrint {
