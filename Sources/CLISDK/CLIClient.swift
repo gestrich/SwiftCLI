@@ -553,6 +553,11 @@ public actor CLIClient {
         let outputPipe: Pipe?
         let errorPipe: Pipe?
         var stdinPipe: Pipe?
+
+        // EOF signals created before the inheritIO branch so their continuations
+        // are in scope for the post-termination forced-finish below.
+        let (stdoutEOFStream, stdoutEOFCont) = AsyncStream<Void>.makeStream()
+        let (stderrEOFStream, stderrEOFCont) = AsyncStream<Void>.makeStream()
         var stdoutEOFSignal: AsyncStream<Void>? = nil
         var stderrEOFSignal: AsyncStream<Void>? = nil
 
@@ -576,10 +581,7 @@ public actor CLIClient {
             outputPipe = outPipe
             errorPipe = errPipe
 
-            // EOF signals: handlers self-cancel and signal when the pipe write-end closes.
-            let (stdoutEOFStream, stdoutEOFCont) = AsyncStream<Void>.makeStream()
             stdoutEOFSignal = stdoutEOFStream
-            let (stderrEOFStream, stderrEOFCont) = AsyncStream<Void>.makeStream()
             stderrEOFSignal = stderrEOFStream
 
             outPipe.fileHandleForReading.readabilityHandler = { handle in
@@ -680,6 +682,16 @@ public actor CLIClient {
         for await _ in terminationSignal { break }
 
         timeoutTask?.cancel()
+
+        // Force-finish EOF streams after process exit via GCD (not Task{}) so the signal
+        // doesn't depend on cooperative thread pool availability under heavy parallel load.
+        // On Linux, EPOLLHUP without EPOLLIN may never trigger readabilityHandler for
+        // processes that produce no output; this guarantees we don't hang waiting for it.
+        // finish() is idempotent — a no-op if the readabilityHandler already signaled EOF.
+        DispatchQueue.global().async {
+            stdoutEOFCont.finish()
+            stderrEOFCont.finish()
+        }
 
         // Wait for readabilityHandlers to consume all pipe data and signal EOF.
         if let stdoutEOF = stdoutEOFSignal {
