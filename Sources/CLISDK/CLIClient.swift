@@ -585,7 +585,8 @@ public actor CLIClient {
             outPipe.fileHandleForReading.readabilityHandler = { handle in
                 let data = handle.availableData
                 if data.isEmpty {
-                    handle.readabilityHandler = nil
+                    // EOF — signal without self-canceling; handler is cancelled from
+                    // outside after the EOF await, which is safe on both macOS and Linux.
                     stdoutEOFCont.yield()
                     stdoutEOFCont.finish()
                 } else if let text = String(data: data, encoding: .utf8) {
@@ -616,7 +617,6 @@ public actor CLIClient {
             errPipe.fileHandleForReading.readabilityHandler = { handle in
                 let data = handle.availableData
                 if data.isEmpty {
-                    handle.readabilityHandler = nil
                     stderrEOFCont.yield()
                     stderrEOFCont.finish()
                 } else if let text = String(data: data, encoding: .utf8) {
@@ -677,13 +677,17 @@ public actor CLIClient {
 
         timeoutTask?.cancel()
 
-        // Wait for readabilityHandlers to consume all pipe data and self-cancel on EOF.
+        // Wait for readabilityHandlers to consume all pipe data and signal EOF.
         if let stdoutEOF = stdoutEOFSignal {
             for await _ in stdoutEOF { break }
         }
         if let stderrEOF = stderrEOFSignal {
             for await _ in stderrEOF { break }
         }
+
+        // Cancel handlers from outside — safe on Linux unlike in-handler cancellation.
+        outputPipe?.fileHandleForReading.readabilityHandler = nil
+        errorPipe?.fileHandleForReading.readabilityHandler = nil
 
         let exitCode = process.terminationStatus
         let duration = Date().timeIntervalSince(startTime)
