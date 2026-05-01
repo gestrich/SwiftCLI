@@ -683,12 +683,10 @@ public actor CLIClient {
 
         timeoutTask?.cancel()
 
-        // Force-finish EOF streams after process exit via GCD (not Task{}) so the signal
-        // doesn't depend on cooperative thread pool availability under heavy parallel load.
-        // On Linux, EPOLLHUP without EPOLLIN may never trigger readabilityHandler for
-        // processes that produce no output; this guarantees we don't hang waiting for it.
+        // Force-finish EOF streams after process exit. On Linux, EPOLLHUP without EPOLLIN
+        // may never trigger readabilityHandler for processes that produce no output.
         // finish() is idempotent — a no-op if the readabilityHandler already signaled EOF.
-        DispatchQueue.global().async {
+        Task {
             stdoutEOFCont.finish()
             stderrEOFCont.finish()
         }
