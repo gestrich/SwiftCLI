@@ -553,6 +553,8 @@ public actor CLIClient {
         let outputPipe: Pipe?
         let errorPipe: Pipe?
         var stdinPipe: Pipe?
+        var stdoutEOFSignal: AsyncStream<Void>? = nil
+        var stderrEOFSignal: AsyncStream<Void>? = nil
 
         if inheritIO {
             process.standardInput = FileHandle.standardInput
@@ -574,10 +576,19 @@ public actor CLIClient {
             outputPipe = outPipe
             errorPipe = errPipe
 
-            // Real-time output handling (always)
+            // EOF signals: handlers self-cancel and signal when the pipe write-end closes.
+            let (stdoutEOFStream, stdoutEOFCont) = AsyncStream<Void>.makeStream()
+            stdoutEOFSignal = stdoutEOFStream
+            let (stderrEOFStream, stderrEOFCont) = AsyncStream<Void>.makeStream()
+            stderrEOFSignal = stderrEOFStream
+
             outPipe.fileHandleForReading.readabilityHandler = { handle in
                 let data = handle.availableData
-                if !data.isEmpty, let text = String(data: data, encoding: .utf8) {
+                if data.isEmpty {
+                    handle.readabilityHandler = nil
+                    stdoutEOFCont.yield()
+                    stdoutEOFCont.finish()
+                } else if let text = String(data: data, encoding: .utf8) {
                     stdoutAccumulator.append(text)
                     if shouldPrint {
                         print(text, terminator: "")
@@ -604,7 +615,11 @@ public actor CLIClient {
 
             errPipe.fileHandleForReading.readabilityHandler = { handle in
                 let data = handle.availableData
-                if !data.isEmpty, let text = String(data: data, encoding: .utf8) {
+                if data.isEmpty {
+                    handle.readabilityHandler = nil
+                    stderrEOFCont.yield()
+                    stderrEOFCont.finish()
+                } else if let text = String(data: data, encoding: .utf8) {
                     stderrAccumulator.append(text)
                     if shouldPrint {
                         print(text, terminator: "")
@@ -662,25 +677,12 @@ public actor CLIClient {
 
         timeoutTask?.cancel()
 
-        // Nil the handlers first so they don't race with the drain reads below.
-        outputPipe?.fileHandleForReading.readabilityHandler = nil
-        errorPipe?.fileHandleForReading.readabilityHandler = nil
-
-        // Drain any bytes that arrived after the last readabilityHandler invocation.
-        // readabilityHandler is GCD-dispatched and may not have consumed all buffered
-        // data by the time the process exits.
-        var drainByteCount = 0
-        if let outPipe = outputPipe,
-           let text = String(data: outPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8),
-           !text.isEmpty {
-            drainByteCount = text.utf8.count
-            stdoutAccumulator.append(text)
-            if shouldPrint { print(text, terminator: "") }
+        // Wait for readabilityHandlers to consume all pipe data and self-cancel on EOF.
+        if let stdoutEOF = stdoutEOFSignal {
+            for await _ in stdoutEOF { break }
         }
-        if let errPipe = errorPipe,
-           let text = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8),
-           !text.isEmpty {
-            stderrAccumulator.append(text)
+        if let stderrEOF = stderrEOFSignal {
+            for await _ in stderrEOF { break }
         }
 
         let exitCode = process.terminationStatus
@@ -731,8 +733,7 @@ public actor CLIClient {
             exitCode: exitCode,
             stdout: stdoutAccumulator.value,
             stderr: stderrAccumulator.value,
-            duration: duration,
-            drainByteCount: drainByteCount
+            duration: duration
         )
     }
 
