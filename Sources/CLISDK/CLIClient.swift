@@ -553,8 +553,11 @@ public actor CLIClient {
         let outputPipe: Pipe?
         let errorPipe: Pipe?
         var stdinPipe: Pipe?
-        var stdoutEOFSignal: AsyncStream<Void>? = nil
-        var stderrEOFSignal: AsyncStream<Void>? = nil
+
+        // DispatchGroups track in-flight readabilityHandler invocations so we can
+        // safely wait for them to finish before draining the pipes ourselves.
+        let stdoutHandlerGroup = DispatchGroup()
+        let stderrHandlerGroup = DispatchGroup()
 
         if inheritIO {
             process.standardInput = FileHandle.standardInput
@@ -576,74 +579,37 @@ public actor CLIClient {
             outputPipe = outPipe
             errorPipe = errPipe
 
-            // EOF signals: handlers self-cancel and signal when the pipe write-end closes.
-            let (stdoutEOFStream, stdoutEOFCont) = AsyncStream<Void>.makeStream()
-            stdoutEOFSignal = stdoutEOFStream
-            let (stderrEOFStream, stderrEOFCont) = AsyncStream<Void>.makeStream()
-            stderrEOFSignal = stderrEOFStream
-
             outPipe.fileHandleForReading.readabilityHandler = { handle in
+                stdoutHandlerGroup.enter()
+                defer { stdoutHandlerGroup.leave() }
                 let data = handle.availableData
-                if data.isEmpty {
-                    // EOF — enqueue via Task so we never call into the Swift concurrency
-                    // runtime directly from a GCD callback (crashes libdispatch on Linux).
-                    Task {
-                        stdoutEOFCont.yield()
-                        stdoutEOFCont.finish()
-                    }
-                } else if let text = String(data: data, encoding: .utf8) {
-                    stdoutAccumulator.append(text)
-                    if shouldPrint {
-                        print(text, terminator: "")
-                    }
-
-                    let streamOutput = StreamOutput.stdout(commandID: commandID, text: text)
-
-                    // Yield to per-command stream (if provided)
-                    commandContinuation?.yield(streamOutput)
-
-                    // Broadcast to global stream
-                    Task {
-                        await globalOutputStream.send(streamOutput)
-                    }
-
-                    // Send to client's stream (if provided)
-                    if let clientOutput = clientOutputStream {
-                        Task {
-                            await clientOutput.send(streamOutput)
-                        }
-                    }
+                guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
+                stdoutAccumulator.append(text)
+                if shouldPrint {
+                    print(text, terminator: "")
+                }
+                let streamOutput = StreamOutput.stdout(commandID: commandID, text: text)
+                commandContinuation?.yield(streamOutput)
+                Task { await globalOutputStream.send(streamOutput) }
+                if let clientOutput = clientOutputStream {
+                    Task { await clientOutput.send(streamOutput) }
                 }
             }
 
             errPipe.fileHandleForReading.readabilityHandler = { handle in
+                stderrHandlerGroup.enter()
+                defer { stderrHandlerGroup.leave() }
                 let data = handle.availableData
-                if data.isEmpty {
-                    Task {
-                        stderrEOFCont.yield()
-                        stderrEOFCont.finish()
-                    }
-                } else if let text = String(data: data, encoding: .utf8) {
-                    stderrAccumulator.append(text)
-                    if shouldPrint {
-                        print(text, terminator: "")
-                    }
-
-                    let streamOutput = StreamOutput.stderr(commandID: commandID, text: text)
-
-                    commandContinuation?.yield(streamOutput)
-
-                    // Broadcast to global stream
-                    Task {
-                        await globalOutputStream.send(streamOutput)
-                    }
-
-                    // Send to client's stream (if provided)
-                    if let clientOutput = clientOutputStream {
-                        Task {
-                            await clientOutput.send(streamOutput)
-                        }
-                    }
+                guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
+                stderrAccumulator.append(text)
+                if shouldPrint {
+                    print(text, terminator: "")
+                }
+                let streamOutput = StreamOutput.stderr(commandID: commandID, text: text)
+                commandContinuation?.yield(streamOutput)
+                Task { await globalOutputStream.send(streamOutput) }
+                if let clientOutput = clientOutputStream {
+                    Task { await clientOutput.send(streamOutput) }
                 }
             }
         }
@@ -681,18 +647,56 @@ public actor CLIClient {
 
         timeoutTask?.cancel()
 
-        // Wait for readabilityHandlers to consume all pipe data and signal EOF.
-        if let stdoutEOF = stdoutEOFSignal {
-            for await _ in stdoutEOF { break }
-        }
-        if let stderrEOF = stderrEOFSignal {
-            for await _ in stderrEOF { break }
-        }
-
-        // Cancel handlers from outside — safe on Linux unlike in-handler cancellation.
+        // Stop readabilityHandlers — no new invocations after this point.
         outputPipe?.fileHandleForReading.readabilityHandler = nil
         errorPipe?.fileHandleForReading.readabilityHandler = nil
 
+        // Wait for any currently-executing handler invocations to complete.
+        // DispatchGroup.notify fires when the in-flight count drops to zero;
+        // if no invocation is running it fires immediately.
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            stdoutHandlerGroup.notify(queue: .global()) { cont.resume() }
+        }
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            stderrHandlerGroup.notify(queue: .global()) { cont.resume() }
+        }
+
+        // Drain any data remaining in the pipe buffer that the handler did not process.
+        // This handles two Linux-specific cases:
+        //   1. EPOLLHUP without EPOLLIN — readabilityHandler never fires for zero-output processes.
+        //   2. SIGCHLD arriving before EPOLLIN — process exit is observed before the kernel
+        //      delivers the final data chunk, causing us to cancel the handler too early.
+        // availableData is non-blocking here because the write end is already closed.
+        if let outPipe = outputPipe {
+            while true {
+                let data = outPipe.fileHandleForReading.availableData
+                guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { break }
+                stdoutAccumulator.append(text)
+                if shouldPrint { print(text, terminator: "") }
+                let streamOutput = StreamOutput.stdout(commandID: commandID, text: text)
+                commandContinuation?.yield(streamOutput)
+                Task { await globalOutputStream.send(streamOutput) }
+                if let co = clientOutputStream { Task { await co.send(streamOutput) } }
+            }
+        }
+        if let errPipe = errorPipe {
+            while true {
+                let data = errPipe.fileHandleForReading.availableData
+                guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { break }
+                stderrAccumulator.append(text)
+                if shouldPrint { print(text, terminator: "") }
+                let streamOutput = StreamOutput.stderr(commandID: commandID, text: text)
+                commandContinuation?.yield(streamOutput)
+                Task { await globalOutputStream.send(streamOutput) }
+                if let co = clientOutputStream { Task { await co.send(streamOutput) } }
+            }
+        }
+
+        // Task cancellation can cause the for-await above to exit before SIGTERM is
+        // processed, so guard here to avoid the NSInvalidArgumentException crash.
+        if process.isRunning {
+            process.waitUntilExit()
+        }
         let exitCode = process.terminationStatus
         let duration = Date().timeIntervalSince(startTime)
 
@@ -1133,6 +1137,9 @@ public actor CLIClient {
         // Clean up stderr handler
         stderrPipe.fileHandleForReading.readabilityHandler = nil
 
+        if process.isRunning {
+            process.waitUntilExit()
+        }
         let exitCode = process.terminationStatus
 
         // Send exit to output streams
