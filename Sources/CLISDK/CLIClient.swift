@@ -692,6 +692,11 @@ public actor CLIClient {
             }
         }
 
+        // Task cancellation can cause the for-await above to exit before SIGTERM is
+        // processed, so guard here to avoid the NSInvalidArgumentException crash.
+        if process.isRunning {
+            process.waitUntilExit()
+        }
         let exitCode = process.terminationStatus
         let duration = Date().timeIntervalSince(startTime)
 
@@ -1132,6 +1137,9 @@ public actor CLIClient {
         // Clean up stderr handler
         stderrPipe.fileHandleForReading.readabilityHandler = nil
 
+        if process.isRunning {
+            process.waitUntilExit()
+        }
         let exitCode = process.terminationStatus
 
         // Send exit to output streams

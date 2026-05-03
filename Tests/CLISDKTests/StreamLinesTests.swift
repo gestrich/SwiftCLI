@@ -234,6 +234,57 @@ struct JSONLineParserTests {
     }
 }
 
+// MARK: - Cancellation Tests
+
+@Suite("Cancellation Tests")
+struct CancellationTests {
+
+    // Regression test: cancelling a task during execute() used to crash with
+    // NSInvalidArgumentException "-[NSConcreteTask terminationStatus]: task still running"
+    // because AsyncStream honours task cancellation and could exit the for-await before
+    // SIGTERM was processed by the child process.
+    @Test("Cancelling execute mid-flight does not crash")
+    func testCancelDuringExecuteNoCrash() async {
+        let client = CLIClient(printOutput: false)
+
+        let task = Task {
+            _ = try? await client.execute(
+                command: "/bin/sleep",
+                arguments: ["10"],
+                printCommand: false
+            )
+        }
+
+        // Give the process time to start before cancelling.
+        try? await Task.sleep(nanoseconds: 100_000_000)
+
+        task.cancel()
+        await task.value
+        // Reaching here without aborting means the fix is in place.
+    }
+
+    @Test("Cancelling execute returns without hanging")
+    func testCancelDuringExecuteCompletes() async throws {
+        let client = CLIClient(printOutput: false)
+        let start = Date()
+
+        let task = Task {
+            _ = try? await client.execute(
+                command: "/bin/sleep",
+                arguments: ["10"],
+                printCommand: false
+            )
+        }
+
+        try await Task.sleep(nanoseconds: 100_000_000)
+        task.cancel()
+        await task.value
+
+        let elapsed = Date().timeIntervalSince(start)
+        #expect(elapsed < 5.0, "Task should complete quickly after cancellation, not hang")
+    }
+}
+
 // MARK: - Test Helpers
 
 /// A test parser that parses integer lines and skips non-integer lines
